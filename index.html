@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="hi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Live Voice Changer</title>
+<style>
+  :root{--bg:#0f1115;--card:#1a1d24;--acc:#7c5cff;--acc2:#22d3a6;--txt:#eef0f5;--mut:#8b91a1}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,sans-serif;padding:16px;max-width:520px;margin:auto}
+  h1{font-size:20px;margin:4px 0 2px}
+  .sub{color:var(--mut);font-size:13px;margin-bottom:14px}
+  #start{width:100%;padding:18px;font-size:18px;font-weight:700;border:0;border-radius:16px;background:var(--acc);color:#fff}
+  #start.on{background:#e5484d}
+  .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:16px 0}
+  .m{background:var(--card);border:2px solid transparent;border-radius:14px;padding:14px 4px;text-align:center;font-size:13px;color:var(--txt)}
+  .m span{display:block;font-size:26px;margin-bottom:4px}
+  .m.sel{border-color:var(--acc2);background:#17262a}
+  .row{background:var(--card);border-radius:14px;padding:12px 14px;margin-bottom:10px}
+  .row label{display:flex;justify-content:space-between;font-size:13px;color:var(--mut)}
+  input[type=range]{width:100%;margin-top:8px}
+  #meter{height:8px;background:#2a2e38;border-radius:6px;overflow:hidden;margin:12px 0}
+  #bar{height:100%;width:0;background:linear-gradient(90deg,var(--acc2),var(--acc))}
+  .note{font-size:12px;color:var(--mut);line-height:1.5;margin-top:12px}
+  #status{font-size:13px;margin-top:8px;color:var(--acc2);min-height:18px}
+</style>
+</head>
+<body>
+<h1>🎙️ Live Voice Changer</h1>
+<div class="sub">Phone = mic, Bluetooth speaker = output</div>
+
+<button id="start">▶ START MIC</button>
+<div id="status"></div>
+<div id="meter"><div id="bar"></div></div>
+
+<div class="grid" id="modes"></div>
+
+<div class="row"><label>Volume <b id="vv">100%</b></label>
+<input type="range" id="vol" min="0" max="200" value="100"></div>
+<div class="row"><label>Pitch fine-tune <b id="pv">0</b></label>
+<input type="range" id="pitch" min="-12" max="12" step="1" value="0"></div>
+
+<div class="note">
+⚠️ Feedback (seeti) se bachne ke liye speaker phone se door rakho ya volume kam rakho.<br>
+Bluetooth me thoda delay (150–300ms) normal hai.
+</div>
+
+<script>
+// ---------- AudioWorklet: real-time pitch shifter (granular, 2 crossfading taps) ----------
+const workletCode = `
+class PitchShifter extends AudioWorkletProcessor {
+  constructor(){
+    super();
+    this.N = 16384; this.buf = new Float32Array(this.N);
+    this.w = 0; this.phase = 0; this.ratio = 1;
+    this.win = Math.floor(sampleRate * 0.05);
+    this.port.onmessage = e => { this.ratio = e.data; };
+  }
+  read(d){
+    let p = this.w - d; while(p < 0) p += this.N;
+    const i = Math.floor(p), f = p - i;
+    const a = this.buf[i % this.N], b = this.buf[(i+1) % this.N];
+    return a + (b - a) * f;
+  }
+  process(inputs, outputs){
+    const inp = inputs[0][0], out = outputs[0][0];
+    if(!inp) return true;
+    const win = this.win;
+    for(let i=0;i<out.length;i++){
+      this.buf[this.w] = inp[i];
+      const p2 = (this.phase + 0.5) % 1;
+      const g1 = Math.sin(Math.PI * this.phase), g2 = Math.sin(Math.PI * p2);
+      out[i] = this.read(this.phase * win + 1) * g1 + this.read(p2 * win + 1) * g2;
+      this.phase += (1 - this.ratio) / win;
+      this.phase -= Math.floor(this.phase);
+      this.w = (this.w + 1) % this.N;
+    }
+    return true;
+  }
+}
+registerProcessor('pitch-shifter', PitchShifter);
+`;
+
+// ---------- Modes ----------
+// pitch: ratio | ring: Hz (0=off) | dist: amount | lp/hp: filter Hz | echo: [delay s, feedback] | trem: Hz | low/high: shelf dB
+const MODES = {
+  original:{n:'Original',e:'🙂',pitch:1},
+  man:     {n:'Man',e:'👨',pitch:0.78,low:6,lp:6000},
+  girl:    {n:'Girl',e:'👧',pitch:1.38,high:5,hp:150},
+  child:   {n:'Child',e:'🧒',pitch:1.75,high:6,hp:200},
+  robot:   {n:'Robot',e:'🤖',pitch:1,ring:55,echo:[0.012,0.55]},
+  dino:    {n:'Dinosaur',e:'🦖',pitch:0.55,dist:12,lp:2200,trem:7,low:8},
+  monster: {n:'Monster',e:'👹',pitch:0.45,dist:20,lp:1800,echo:[0.09,0.35],low:10},
+  alien:   {n:'Alien',e:'👽',pitch:1.2,ring:320,trem:5,high:3},
+  mega:    {n:'Megaphone',e:'📢',pitch:1,hp:700,lp:3200,dist:25},
+  hall:    {n:'Echo Hall',e:'🏛️',pitch:1,echo:[0.22,0.5]},
+};
+
+let ctx, stream, src, nodes = {}, running = false, current = 'original', rafId;
+
+function makeCurve(k){
+  const n=1024, c=new Float32Array(n);
+  for(let i=0;i<n;i++){const x=i*2/n-1; c[i]=((3+k)*x*20*Math.PI/180)/(Math.PI+k*Math.abs(x));}
+  return c;
+}
+
+async function start(){
+  stream = await navigator.mediaDevices.getUserMedia({audio:{
+    echoCancellation:true, noiseSuppression:true, autoGainControl:true, channelCount:1
+  }});
+  ctx = new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});
+  const url = URL.createObjectURL(new Blob([workletCode],{type:'application/javascript'}));
+  await ctx.audioWorklet.addModule(url);
+
+  src = ctx.createMediaStreamSource(stream);
+  const n = nodes;
+  n.hp = ctx.createBiquadFilter(); n.hp.type='highpass'; n.hp.frequency.value=60;
+  n.pitch = new AudioWorkletNode(ctx,'pitch-shifter');
+  n.low = ctx.createBiquadFilter(); n.low.type='lowshelf'; n.low.frequency.value=200;
+  n.high = ctx.createBiquadFilter(); n.high.type='highshelf'; n.high.frequency.value=3000;
+  n.ring = ctx.createGain(); n.ring.gain.value = 1;
+  n.osc = ctx.createOscillator(); n.osc.type='sine'; n.osc.frequency.value=50;
+  n.oscGain = ctx.createGain(); n.oscGain.gain.value = 0; // 0 = bypass
+  n.dist = ctx.createWaveShaper(); n.dist.oversample='2x';
+  n.lp = ctx.createBiquadFilter(); n.lp.type='lowpass'; n.lp.frequency.value=12000;
+  n.tremG = ctx.createGain(); n.tremG.gain.value = 1;
+  n.tremO = ctx.createOscillator(); n.tremO.frequency.value = 5;
+  n.tremD = ctx.createGain(); n.tremD.gain.value = 0;
+  n.dry = ctx.createGain();
+  n.delay = ctx.createDelay(1); n.fb = ctx.createGain(); n.wet = ctx.createGain();
+  n.mix = ctx.createGain();
+  n.comp = ctx.createDynamicsCompressor();
+  n.out = ctx.createGain();
+  n.analyser = ctx.createAnalyser(); n.analyser.fftSize = 256;
+
+  // chain
+  src.connect(n.hp).connect(n.pitch).connect(n.low).connect(n.high).connect(n.ring);
+  // ring modulation: carrier drives ring gain; when off, gain stays 1
+  n.osc.connect(n.oscGain).connect(n.ring.gain);
+  n.ring.connect(n.dist).connect(n.lp).connect(n.tremG).connect(n.mix);
+  n.tremO.connect(n.tremD).connect(n.tremG.gain);
+  // echo send
+  n.tremG.connect(n.delay); n.delay.connect(n.fb).connect(n.delay);
+  n.delay.connect(n.wet).connect(n.mix);
+  n.mix.connect(n.comp).connect(n.out).connect(n.analyser);
+  n.out.connect(ctx.destination);
+  n.osc.start(); n.tremO.start();
+
+  running = true;
+  applyMode(current);
+  applyVol();
+  meter();
+}
+
+function applyMode(key){
+  current = key;
+  document.querySelectorAll('.m').forEach(b=>b.classList.toggle('sel', b.dataset.k===key));
+  if(!running) return;
+  const m = MODES[key], n = nodes, t = ctx.currentTime;
+  n.baseRatio = m.pitch||1;
+  applyPitch();
+  n.low.gain.setTargetAtTime(m.low||0,t,0.02);
+  n.high.gain.setTargetAtTime(m.high||0,t,0.02);
+  n.hp.frequency.setTargetAtTime(m.hp||60,t,0.02);
+  n.lp.frequency.setTargetAtTime(m.lp||12000,t,0.02);
+  if(m.ring){ n.ring.gain.value = 0; n.osc.frequency.setTargetAtTime(m.ring,t,0.01); n.oscGain.gain.setTargetAtTime(1,t,0.01); }
+  else { n.oscGain.gain.setTargetAtTime(0,t,0.01); n.ring.gain.value = 1; }
+  n.dist.curve = m.dist ? makeCurve(m.dist) : null;
+  if(m.trem){ n.tremO.frequency.setTargetAtTime(m.trem,t,0.01); n.tremD.gain.setTargetAtTime(0.35,t,0.01); n.tremG.gain.value = 0.65; }
+  else { n.tremD.gain.setTargetAtTime(0,t,0.01); n.tremG.gain.value = 1; }
+  const e = m.echo || [0.001, 0];
+  n.delay.delayTime.setTargetAtTime(e[0],t,0.02);
+  n.fb.gain.setTargetAtTime(e[1],t,0.02);
+  n.wet.gain.setTargetAtTime(m.echo?0.7:0,t,0.02);
+}
+
+function applyPitch(){
+  if(!running) return;
+  const semis = +document.getElementById('pitch').value;
+  document.getElementById('pv').textContent = (semis>0?'+':'')+semis;
+  const r = (nodes.baseRatio||1) * Math.pow(2, semis/12);
+  nodes.pitch.port.postMessage(r);
+}
+function applyVol(){
+  const v = +document.getElementById('vol').value;
+  document.getElementById('vv').textContent = v+'%';
+  if(running) nodes.out.gain.setTargetAtTime(v/100, ctx.currentTime, 0.02);
+}
+
+function meter(){
+  const a = new Uint8Array(nodes.analyser.frequencyBinCount);
+  (function loop(){
+    nodes.analyser.getByteTimeDomainData(a);
+    let peak=0; for(const x of a) peak=Math.max(peak,Math.abs(x-128));
+    document.getElementById('bar').style.width = Math.min(100,peak/128*160)+'%';
+    rafId = requestAnimationFrame(loop);
+  })();
+}
+
+async function stop(){
+  cancelAnimationFrame(rafId);
+  stream.getTracks().forEach(t=>t.stop());
+  await ctx.close();
+  running=false; nodes={};
+  document.getElementById('bar').style.width='0';
+}
+
+// ---------- UI ----------
+const grid = document.getElementById('modes');
+for(const [k,m] of Object.entries(MODES)){
+  const b = document.createElement('button');
+  b.className='m'+(k===current?' sel':''); b.dataset.k=k;
+  b.innerHTML=`<span>${m.e}</span>${m.n}`;
+  b.onclick=()=>applyMode(k);
+  grid.appendChild(b);
+}
+const btn = document.getElementById('start'), st = document.getElementById('status');
+btn.onclick = async ()=>{
+  try{
+    if(!running){
+      st.textContent='Starting...';
+      await start();
+      btn.textContent='⏹ STOP'; btn.classList.add('on');
+      st.textContent='Live ✔  (bolo, awaaz Bluetooth speaker pe aayegi)';
+    } else {
+      await stop();
+      btn.textContent='▶ START MIC'; btn.classList.remove('on'); st.textContent='';
+    }
+  }catch(err){
+    st.style.color='#e5484d';
+    st.textContent='Error: '+err.message+' (localhost pe kholo & mic permission do)';
+  }
+};
+document.getElementById('vol').oninput=applyVol;
+document.getElementById('pitch').oninput=applyPitch;
+</script>
+</body>
+</html>

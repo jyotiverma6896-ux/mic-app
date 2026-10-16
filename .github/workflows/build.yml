@@ -1,0 +1,97 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths: [index.html, .github/workflows/build.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create Capacitor project
+        run: |
+          mkdir -p app/www && cd app
+          cp ../index.html www/index.html
+          # service worker / manifest are not needed inside the APK
+          sed -i -e '/manifest.json/d' -e '/serviceWorker/d' -e '/icon-192.png/d' www/index.html
+          npm init -y
+          npm i @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          cat > capacitor.config.json <<'EOF'
+          {
+            "appId": "com.voicemic.live",
+            "appName": "Voice Mic",
+            "webDir": "www",
+            "server": { "androidScheme": "https" }
+          }
+          EOF
+          npx cap add android
+          sed -i 's#</manifest>#<uses-permission android:name="android.permission.RECORD_AUDIO"/><uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/><uses-permission android:name="android.permission.WAKE_LOCK"/></manifest>#' android/app/src/main/AndroidManifest.xml
+          grep -c RECORD_AUDIO android/app/src/main/AndroidManifest.xml
+
+      - name: App icon
+        continue-on-error: true
+        working-directory: app
+        run: |
+          mkdir -p assets
+          cat > icon.py <<'EOF'
+          import zlib, struct, math
+          S = 1024
+          rows = []
+          for y in range(S):
+              row = bytearray([0])
+              for x in range(S):
+                  fx, fy = x / S, y / S
+                  col = (124, 92, 255, 255)
+                  white = False
+                  r = 0.11
+                  if abs(fx - 0.5) <= r and 0.22 + r <= fy <= 0.52 - r: white = True
+                  elif (fx - 0.5) ** 2 + (fy - (0.22 + r)) ** 2 <= r * r: white = True
+                  elif (fx - 0.5) ** 2 + (fy - (0.52 - r)) ** 2 <= r * r: white = True
+                  d = math.hypot(fx - 0.5, fy - 0.45)
+                  if fy >= 0.45 and 0.205 <= d <= 0.24: white = True
+                  if abs(fx - 0.5) <= 0.016 and 0.685 <= fy <= 0.78: white = True
+                  if abs(fx - 0.5) <= 0.10 and 0.77 <= fy <= 0.80: white = True
+                  if white: col = (255, 255, 255, 255)
+                  row += bytes(col)
+              rows.append(bytes(row))
+          raw = b''.join(rows)
+          def chunk(t, d):
+              c = struct.pack('>I', len(d)) + t + d
+              return c + struct.pack('>I', zlib.crc32(t + d) & 0xffffffff)
+          png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', S, S, 8, 6, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b'')
+          open('assets/icon-only.png', 'wb').write(png)
+          EOF
+          python3 icon.py
+          npm i -D @capacitor/assets
+          npx capacitor-assets generate --android --iconBackgroundColor "#7c5cff"
+
+      - name: Build APK
+        working-directory: app
+        run: |
+          npx cap sync android
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Publish APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/android/app/build/outputs/apk/debug/app-debug.apk VoiceMic.apk
+          gh release create "v${{ github.run_number }}" VoiceMic.apk --title "Voice Mic v${{ github.run_number }}" --notes "Download VoiceMic.apk and install."
