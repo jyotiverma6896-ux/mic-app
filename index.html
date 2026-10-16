@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
 <title>Live Voice Changer</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0f1115">
+<link rel="icon" href="icon-192.png">
 <style>
   :root{--bg:#0f1115;--card:#1a1d24;--acc:#7c5cff;--acc2:#22d3a6;--txt:#eef0f5;--mut:#8b91a1}
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
@@ -18,11 +21,23 @@
   .m.sel{border-color:var(--acc2);background:#17262a}
   .row{background:var(--card);border-radius:14px;padding:12px 14px;margin-bottom:10px}
   .row label{display:flex;justify-content:space-between;font-size:13px;color:var(--mut)}
+  .row h3{margin:0 0 8px;font-size:14px}
   input[type=range]{width:100%;margin-top:8px}
   #meter{height:8px;background:#2a2e38;border-radius:6px;overflow:hidden;margin:12px 0}
   #bar{height:100%;width:0;background:linear-gradient(90deg,var(--acc2),var(--acc))}
   .note{font-size:12px;color:var(--mut);line-height:1.5;margin-top:12px}
   #status{font-size:13px;margin-top:8px;color:var(--acc2);min-height:18px}
+  /* Equalizer */
+  .eq{display:flex;justify-content:space-between;margin-top:6px}
+  .eqc{width:20%;text-align:center}
+  .eqs{position:relative;height:130px}
+  .eqs input{position:absolute;left:50%;top:50%;width:120px;height:30px;margin:-15px 0 0 -60px;transform:rotate(-90deg)}
+  .eqc small{display:block;font-size:11px;color:var(--mut)}
+  .eqc b{display:block;font-size:12px;margin-top:2px}
+  .pre{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+  .pre button{flex:1;min-width:60px;padding:8px 4px;border:0;border-radius:10px;background:#2a2e38;color:var(--txt);font-size:12px}
+  .chk{display:flex;align-items:center;gap:10px;font-size:13px}
+  .chk input{width:20px;height:20px;margin:0}
 </style>
 </head>
 <body>
@@ -37,43 +52,63 @@
 
 <div class="row"><label>Volume <b id="vv">100%</b></label>
 <input type="range" id="vol" min="0" max="200" value="100"></div>
+<div class="row"><label>Mic boost <b id="mv">120%</b></label>
+<input type="range" id="mic" min="20" max="400" value="120"></div>
 <div class="row"><label>Pitch fine-tune <b id="pv">0</b></label>
 <input type="range" id="pitch" min="-12" max="12" step="1" value="0"></div>
 
+<div class="row">
+  <h3>🎚️ Equalizer</h3>
+  <div class="eq" id="eq"></div>
+  <div class="pre" id="presets"></div>
+</div>
+
+<div class="row">
+  <label class="chk"><input type="checkbox" id="nf"> Echo/Noise filter (seeti kam, par quality thodi kam)</label>
+</div>
+
 <div class="note">
-⚠️ Feedback (seeti) se bachne ke liye speaker phone se door rakho ya volume kam rakho.<br>
-Bluetooth me thoda delay (150–300ms) normal hai.
+⚠️ Filter OFF rakhne par awaaz saaf aati hai, par speaker phone ke paas ho to seeti aayegi. Speaker door rakho.<br>
+Bluetooth me thoda delay normal hai. Screen ON rehni chahiye (auto-lock band rakha gaya hai).<br>
+Agar awaaz phir bhi pichi aaye: Bluetooth settings me speaker ka "Call audio / Phone calls" OFF karo.
 </div>
 
 <script>
-// ---------- AudioWorklet: real-time pitch shifter (granular, 2 crossfading taps) ----------
+// ---------- AudioWorklet: real-time pitch shifter (2 crossfading taps, linear crossfade) ----------
 const workletCode = `
 class PitchShifter extends AudioWorkletProcessor {
   constructor(){
     super();
-    this.N = 16384; this.buf = new Float32Array(this.N);
+    this.N = 8192; this.mask = 8191;
+    this.buf = new Float32Array(this.N);
     this.w = 0; this.phase = 0; this.ratio = 1;
-    this.win = Math.floor(sampleRate * 0.05);
+    this.win = Math.floor(sampleRate * 0.04);
     this.port.onmessage = e => { this.ratio = e.data; };
   }
   read(d){
-    let p = this.w - d; while(p < 0) p += this.N;
-    const i = Math.floor(p), f = p - i;
-    const a = this.buf[i % this.N], b = this.buf[(i+1) % this.N];
+    let p = this.w - d; if(p < 0) p += this.N;
+    const i = p | 0, f = p - i;
+    const a = this.buf[i & this.mask], b = this.buf[(i+1) & this.mask];
     return a + (b - a) * f;
   }
   process(inputs, outputs){
     const inp = inputs[0][0], out = outputs[0][0];
-    if(!inp) return true;
+    if(!inp || !out) return true;
+    const bypass = Math.abs(this.ratio - 1) < 0.001;
     const win = this.win;
     for(let i=0;i<out.length;i++){
       this.buf[this.w] = inp[i];
-      const p2 = (this.phase + 0.5) % 1;
-      const g1 = Math.sin(Math.PI * this.phase), g2 = Math.sin(Math.PI * p2);
-      out[i] = this.read(this.phase * win + 1) * g1 + this.read(p2 * win + 1) * g2;
-      this.phase += (1 - this.ratio) / win;
-      this.phase -= Math.floor(this.phase);
-      this.w = (this.w + 1) % this.N;
+      if(bypass){
+        out[i] = inp[i];
+      } else {
+        const p2 = (this.phase + 0.5) % 1;
+        const g1 = 1 - Math.abs(2*this.phase - 1);
+        const g2 = 1 - Math.abs(2*p2 - 1);
+        out[i] = this.read(this.phase * win + 1) * g1 + this.read(p2 * win + 1) * g2;
+        this.phase += (1 - this.ratio) / win;
+        this.phase -= Math.floor(this.phase);
+      }
+      this.w = (this.w + 1) & this.mask;
     }
     return true;
   }
@@ -82,21 +117,33 @@ registerProcessor('pitch-shifter', PitchShifter);
 `;
 
 // ---------- Modes ----------
-// pitch: ratio | ring: Hz (0=off) | dist: amount | lp/hp: filter Hz | echo: [delay s, feedback] | trem: Hz | low/high: shelf dB
 const MODES = {
   original:{n:'Original',e:'🙂',pitch:1},
-  man:     {n:'Man',e:'👨',pitch:0.78,low:6,lp:6000},
-  girl:    {n:'Girl',e:'👧',pitch:1.38,high:5,hp:150},
-  child:   {n:'Child',e:'🧒',pitch:1.75,high:6,hp:200},
-  robot:   {n:'Robot',e:'🤖',pitch:1,ring:55,echo:[0.012,0.55]},
-  dino:    {n:'Dinosaur',e:'🦖',pitch:0.55,dist:12,lp:2200,trem:7,low:8},
-  monster: {n:'Monster',e:'👹',pitch:0.45,dist:20,lp:1800,echo:[0.09,0.35],low:10},
+  man:     {n:'Man',e:'👨',pitch:0.8,low:5,lp:7000},
+  girl:    {n:'Girl',e:'👧',pitch:1.35,high:4,hp:150},
+  child:   {n:'Child',e:'🧒',pitch:1.7,high:5,hp:200},
+  robot:   {n:'Robot',e:'🤖',pitch:1,ring:55,echo:[0.012,0.5]},
+  dino:    {n:'Dinosaur',e:'🦖',pitch:0.58,dist:8,lp:2400,trem:7,low:6},
+  monster: {n:'Monster',e:'👹',pitch:0.48,dist:14,lp:2000,echo:[0.09,0.35],low:8},
   alien:   {n:'Alien',e:'👽',pitch:1.2,ring:320,trem:5,high:3},
-  mega:    {n:'Megaphone',e:'📢',pitch:1,hp:700,lp:3200,dist:25},
+  mega:    {n:'Megaphone',e:'📢',pitch:1,hp:700,lp:3200,dist:15},
   hall:    {n:'Echo Hall',e:'🏛️',pitch:1,echo:[0.22,0.5]},
 };
 
-let ctx, stream, src, nodes = {}, running = false, current = 'original', rafId;
+// ---------- Equalizer ----------
+const EQ_BANDS = [
+  {f:60,   t:'lowshelf',  l:'60'},
+  {f:230,  t:'peaking',   l:'230'},
+  {f:910,  t:'peaking',   l:'910'},
+  {f:3600, t:'peaking',   l:'3.6k'},
+  {f:10000,t:'highshelf', l:'10k'},
+];
+const EQ_PRESETS = {
+  Flat:[0,0,0,0,0], 'Bass+':[9,5,0,-1,-2], Voice:[-5,-1,3,4,1], 'Treble+':[-3,-1,0,5,8], Radio:[-12,-6,4,5,-8]
+};
+let eqVals = [0,0,0,0,0];
+
+let ctx, stream, src, nodes = {}, running = false, current = 'original', rafId, wakeLock = null;
 
 function makeCurve(k){
   const n=1024, c=new Float32Array(n);
@@ -105,51 +152,67 @@ function makeCurve(k){
 }
 
 async function start(){
-  stream = await navigator.mediaDevices.getUserMedia({audio:{
-    echoCancellation:true, noiseSuppression:true, autoGainControl:true, channelCount:1
-  }});
+  // create context immediately inside the click so the browser allows audio
   ctx = new (window.AudioContext||window.webkitAudioContext)({latencyHint:'interactive'});
+  const nf = document.getElementById('nf').checked;
+  stream = await navigator.mediaDevices.getUserMedia({audio:{
+    echoCancellation:nf, noiseSuppression:nf, autoGainControl:false, channelCount:1
+  }});
   const url = URL.createObjectURL(new Blob([workletCode],{type:'application/javascript'}));
   await ctx.audioWorklet.addModule(url);
+  await ctx.resume();
 
   src = ctx.createMediaStreamSource(stream);
   const n = nodes;
+  n.micGain = ctx.createGain();
   n.hp = ctx.createBiquadFilter(); n.hp.type='highpass'; n.hp.frequency.value=60;
-  n.pitch = new AudioWorkletNode(ctx,'pitch-shifter');
+  n.pitch = new AudioWorkletNode(ctx,'pitch-shifter',{
+    numberOfInputs:1, numberOfOutputs:1, outputChannelCount:[1],
+    channelCount:1, channelCountMode:'explicit'
+  });
   n.low = ctx.createBiquadFilter(); n.low.type='lowshelf'; n.low.frequency.value=200;
   n.high = ctx.createBiquadFilter(); n.high.type='highshelf'; n.high.frequency.value=3000;
   n.ring = ctx.createGain(); n.ring.gain.value = 1;
   n.osc = ctx.createOscillator(); n.osc.type='sine'; n.osc.frequency.value=50;
-  n.oscGain = ctx.createGain(); n.oscGain.gain.value = 0; // 0 = bypass
+  n.oscGain = ctx.createGain(); n.oscGain.gain.value = 0;
   n.dist = ctx.createWaveShaper(); n.dist.oversample='2x';
-  n.lp = ctx.createBiquadFilter(); n.lp.type='lowpass'; n.lp.frequency.value=12000;
+  n.lp = ctx.createBiquadFilter(); n.lp.type='lowpass'; n.lp.frequency.value=16000;
   n.tremG = ctx.createGain(); n.tremG.gain.value = 1;
   n.tremO = ctx.createOscillator(); n.tremO.frequency.value = 5;
   n.tremD = ctx.createGain(); n.tremD.gain.value = 0;
-  n.dry = ctx.createGain();
   n.delay = ctx.createDelay(1); n.fb = ctx.createGain(); n.wet = ctx.createGain();
   n.mix = ctx.createGain();
-  n.comp = ctx.createDynamicsCompressor();
+  n.eq = EQ_BANDS.map((b,i)=>{
+    const f = ctx.createBiquadFilter(); f.type=b.t; f.frequency.value=b.f; f.Q.value=1.0; f.gain.value=eqVals[i]; return f;
+  });
+  n.limit = ctx.createDynamicsCompressor();
+  n.limit.threshold.value=-4; n.limit.knee.value=0; n.limit.ratio.value=20;
+  n.limit.attack.value=0.003; n.limit.release.value=0.1;
   n.out = ctx.createGain();
   n.analyser = ctx.createAnalyser(); n.analyser.fftSize = 256;
 
-  // chain
-  src.connect(n.hp).connect(n.pitch).connect(n.low).connect(n.high).connect(n.ring);
-  // ring modulation: carrier drives ring gain; when off, gain stays 1
+  src.connect(n.micGain).connect(n.hp).connect(n.pitch).connect(n.low).connect(n.high).connect(n.ring);
   n.osc.connect(n.oscGain).connect(n.ring.gain);
   n.ring.connect(n.dist).connect(n.lp).connect(n.tremG).connect(n.mix);
   n.tremO.connect(n.tremD).connect(n.tremG.gain);
-  // echo send
   n.tremG.connect(n.delay); n.delay.connect(n.fb).connect(n.delay);
   n.delay.connect(n.wet).connect(n.mix);
-  n.mix.connect(n.comp).connect(n.out).connect(n.analyser);
+  let last = n.mix;
+  n.eq.forEach(f=>{ last.connect(f); last = f; });
+  last.connect(n.limit).connect(n.out).connect(n.analyser);
   n.out.connect(ctx.destination);
   n.osc.start(); n.tremO.start();
 
   running = true;
   applyMode(current);
-  applyVol();
+  applyVol(); applyMic();
   meter();
+  try{ wakeLock = await navigator.wakeLock.request('screen'); }catch(e){}
+  setTimeout(()=>{
+    if(!running) return;
+    const ms = Math.round(((ctx.baseLatency||0)+(ctx.outputLatency||0))*1000);
+    document.getElementById('status').textContent = 'Live ✔  (app delay ~'+ms+'ms + Bluetooth delay)';
+  },600);
 }
 
 function applyMode(key){
@@ -162,34 +225,46 @@ function applyMode(key){
   n.low.gain.setTargetAtTime(m.low||0,t,0.02);
   n.high.gain.setTargetAtTime(m.high||0,t,0.02);
   n.hp.frequency.setTargetAtTime(m.hp||60,t,0.02);
-  n.lp.frequency.setTargetAtTime(m.lp||12000,t,0.02);
+  n.lp.frequency.setTargetAtTime(m.lp||16000,t,0.02);
   if(m.ring){ n.ring.gain.value = 0; n.osc.frequency.setTargetAtTime(m.ring,t,0.01); n.oscGain.gain.setTargetAtTime(1,t,0.01); }
   else { n.oscGain.gain.setTargetAtTime(0,t,0.01); n.ring.gain.value = 1; }
   n.dist.curve = m.dist ? makeCurve(m.dist) : null;
   if(m.trem){ n.tremO.frequency.setTargetAtTime(m.trem,t,0.01); n.tremD.gain.setTargetAtTime(0.35,t,0.01); n.tremG.gain.value = 0.65; }
   else { n.tremD.gain.setTargetAtTime(0,t,0.01); n.tremG.gain.value = 1; }
-  const e = m.echo || [0.001, 0];
+  const e = m.echo || [0.005, 0];
   n.delay.delayTime.setTargetAtTime(e[0],t,0.02);
   n.fb.gain.setTargetAtTime(e[1],t,0.02);
   n.wet.gain.setTargetAtTime(m.echo?0.7:0,t,0.02);
 }
 
 function applyPitch(){
-  if(!running) return;
   const semis = +document.getElementById('pitch').value;
   document.getElementById('pv').textContent = (semis>0?'+':'')+semis;
-  const r = (nodes.baseRatio||1) * Math.pow(2, semis/12);
-  nodes.pitch.port.postMessage(r);
+  if(!running) return;
+  nodes.pitch.port.postMessage((nodes.baseRatio||1) * Math.pow(2, semis/12));
 }
 function applyVol(){
   const v = +document.getElementById('vol').value;
   document.getElementById('vv').textContent = v+'%';
   if(running) nodes.out.gain.setTargetAtTime(v/100, ctx.currentTime, 0.02);
 }
+function applyMic(){
+  const v = +document.getElementById('mic').value;
+  document.getElementById('mv').textContent = v+'%';
+  if(running) nodes.micGain.gain.setTargetAtTime(v/100, ctx.currentTime, 0.02);
+}
+function applyEq(){
+  eqVals.forEach((v,i)=>{
+    document.getElementById('ev'+i).textContent = (v>0?'+':'')+v;
+    document.getElementById('es'+i).value = v;
+    if(running) nodes.eq[i].gain.setTargetAtTime(v, ctx.currentTime, 0.02);
+  });
+}
 
 function meter(){
   const a = new Uint8Array(nodes.analyser.frequencyBinCount);
   (function loop(){
+    if(!running) return;
     nodes.analyser.getByteTimeDomainData(a);
     let peak=0; for(const x of a) peak=Math.max(peak,Math.abs(x-128));
     document.getElementById('bar').style.width = Math.min(100,peak/128*160)+'%';
@@ -198,10 +273,12 @@ function meter(){
 }
 
 async function stop(){
+  running=false;
   cancelAnimationFrame(rafId);
-  stream.getTracks().forEach(t=>t.stop());
-  await ctx.close();
-  running=false; nodes={};
+  try{ stream.getTracks().forEach(t=>t.stop()); }catch(e){}
+  try{ await ctx.close(); }catch(e){}
+  try{ if(wakeLock){ await wakeLock.release(); wakeLock=null; } }catch(e){}
+  nodes={};
   document.getElementById('bar').style.width='0';
 }
 
@@ -214,25 +291,51 @@ for(const [k,m] of Object.entries(MODES)){
   b.onclick=()=>applyMode(k);
   grid.appendChild(b);
 }
+const eqEl = document.getElementById('eq');
+EQ_BANDS.forEach((b,i)=>{
+  const c = document.createElement('div'); c.className='eqc';
+  c.innerHTML = `<b id="ev${i}">0</b><div class="eqs"><input type="range" id="es${i}" min="-12" max="12" step="1" value="0"></div><small>${b.l}</small>`;
+  eqEl.appendChild(c);
+  c.querySelector('input').oninput = e=>{ eqVals[i] = +e.target.value; applyEq(); };
+});
+const preEl = document.getElementById('presets');
+for(const [name,vals] of Object.entries(EQ_PRESETS)){
+  const b = document.createElement('button'); b.textContent = name;
+  b.onclick = ()=>{ eqVals = vals.slice(); applyEq(); };
+  preEl.appendChild(b);
+}
+
 const btn = document.getElementById('start'), st = document.getElementById('status');
-btn.onclick = async ()=>{
+async function toggle(){
   try{
     if(!running){
+      st.style.color='';
       st.textContent='Starting...';
       await start();
       btn.textContent='⏹ STOP'; btn.classList.add('on');
-      st.textContent='Live ✔  (bolo, awaaz Bluetooth speaker pe aayegi)';
     } else {
       await stop();
       btn.textContent='▶ START MIC'; btn.classList.remove('on'); st.textContent='';
     }
   }catch(err){
+    running=false;
     st.style.color='#e5484d';
     st.textContent='Error: '+err.message+' (localhost pe kholo & mic permission do)';
   }
+}
+btn.onclick = toggle;
+document.getElementById('nf').onchange = async ()=>{
+  if(running){ await stop(); await toggle(); }
 };
 document.getElementById('vol').oninput=applyVol;
+document.getElementById('mic').oninput=applyMic;
 document.getElementById('pitch').oninput=applyPitch;
+document.addEventListener('visibilitychange', async ()=>{
+  if(document.visibilityState==='visible' && running){
+    try{ await ctx.resume(); wakeLock = await navigator.wakeLock.request('screen'); }catch(e){}
+  }
+});
+if('serviceWorker' in navigator){ navigator.serviceWorker.register('sw.js').catch(()=>{}); }
 </script>
 </body>
 </html>
